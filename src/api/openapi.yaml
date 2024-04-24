@@ -1750,7 +1750,8 @@ components:
 
   examples:
     RemediationLinks:
-      first: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=0
-      last: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=50
-      next: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=50
-      previous: null
+      value:
+        first: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=0
+        last: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=50
+        next: /api/remediations/v1/remediations?sort=-updated_at&limit=50&offset=50
+        previous: null
