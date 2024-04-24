@@ -102,6 +102,13 @@ describe('remediations', function () {
             }
         });
 
+        test('fields[data]=names cannot be combined', async () => {
+            const {body} = await request
+                .get('/v1/remediations?fields[data]=playbook_runs&fields[data]=name')
+                .set(auth.fifi)
+                .expect(400);
+        });
+
         test('does not leak data outside of the account', async () => {
             const {body} = await request
             .get('/v1/remediations?username=99999')
