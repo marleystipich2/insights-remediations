@@ -91,7 +91,7 @@ exports.list = async function (
     // set primary sort
     switch (primaryOrder) {
         case 'status':
-            sortOrder.push([col('remediation.name'), asc ? 'ASC' : 'DESC']);
+            sortOrder.push([literal('MAX(dispatcher_runs.status)'), asc ? 'ASC' : 'DESC']);
             break;
 
         case 'last_run_at':
@@ -119,7 +119,8 @@ exports.list = async function (
             [cast(COUNT(DISTINCT(col('issues.id'))), 'int'), 'issue_count'],
             [cast(COUNT(DISTINCT(col('issues->systems.system_id'))), 'int'), 'system_count'],
             [resolvedCountSubquery(), 'resolved_count'],
-            [MAX(col('playbook_runs.created_at')), 'last_run_at']
+            [MAX(col('playbook_runs.created_at')), 'last_run_at'],
+            [MAX(col('dispatcher_runs.status')), 'status']
         ],
         include: [{
             attributes: [],
@@ -134,6 +135,11 @@ exports.list = async function (
         {
             model: db.playbook_runs,
             as: 'playbook_runs',
+            attributes: [],
+            required: false
+        },
+        {
+            model: db.dispatcher_runs,
             attributes: [],
             required: false
         }],
