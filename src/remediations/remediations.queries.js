@@ -8,9 +8,121 @@ const db = require('../db');
 const {NULL_NAME_VALUE} = require('./models/remediation');
 const _ = require('lodash');
 const trace = require('../util/trace');
+const log = require('../util/log');
 const dispatcher = require('../connectors/dispatcher');
 
 const CACHE_TTL = config.db.cache.ttl;
+
+// Helper function to generate aggregate status calculation SQL
+function aggregateStatusSQL() {
+    return `
+        CASE 
+            WHEN COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'failure' THEN 1 END) > 0 
+              OR COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'timeout' THEN 1 END) > 0 
+            THEN 'failure'
+            WHEN COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'running' THEN 1 END) > 0 
+              AND COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'timeout' THEN 1 END) = 0 
+              AND COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'failure' THEN 1 END) = 0 
+            THEN 'running'
+            WHEN COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'success' THEN 1 END) > 0 
+              AND COUNT(CASE WHEN "playbook_runs->dispatcher_runs"."status" = 'timeout' THEN 1 END) = 0 
+            THEN 'success'
+            ELSE 'pending'
+        END
+    `;
+}
+
+
+
+/**
+ * Ensures dispatcher_runs records exist and are up-to-date for status queries
+ * 
+ * This function:
+ * 1. Creates missing dispatcher_runs records for old playbook runs (backfill)
+ * 2. Updates stale non-final statuses in case Kafka messages were missed
+ */
+async function ensureDispatcherRunsForStatusQueries(tenant_org_id, created_by) {
+    // Find playbook runs that need dispatcher_runs updates
+    const runsToUpdate = await db.s.query(`
+        SELECT pr.id, 
+               dr.dispatcher_run_id, 
+               dr.status as current_status,
+               CASE 
+                   WHEN dr.dispatcher_run_id IS NULL THEN 'missing'
+                   WHEN dr.status IN ('pending', 'running') THEN 'stale'
+                   ELSE 'ok'
+               END as update_type
+        FROM playbook_runs pr
+        JOIN remediations r ON pr.remediation_id = r.id
+        LEFT JOIN dispatcher_runs dr ON pr.id = dr.remediations_run_id
+        WHERE r.tenant_org_id = :tenant_org_id 
+          AND r.created_by = :created_by
+          AND (
+            -- Missing records or stale non-final statuses
+            dr.dispatcher_run_id IS NULL OR dr.status IN ('pending', 'running')
+          )
+                 ORDER BY pr.created_at DESC
+        LIMIT 100
+    `, {
+        replacements: { tenant_org_id, created_by },
+        type: db.s.QueryTypes.SELECT
+    });
+
+    for (const run of runsToUpdate) {
+        try {
+            // Call playbook-dispatcher API to get current status
+            const filter = {
+                filter: { 
+                    service: 'remediations',
+                    labels: { 'playbook-run': run.id } 
+                }
+            };
+            const fields = {
+                fields: { data: ['id', 'status'] }
+            };
+            
+            const dispatcherData = await dispatcher.fetchPlaybookRuns(filter, fields);
+            
+            if (dispatcherData?.data?.length > 0) {
+                if (run.update_type === 'missing') {
+                    // Create dispatcher_runs records for old runs that predate this table or missed Kafka updates
+                    const dispatcherRuns = dispatcherData.data.map(d => ({
+                        dispatcher_run_id: d.id,
+                        remediations_run_id: run.id,
+                        status: d.status,
+                        created_at: new Date(),
+                        updated_at: new Date(),
+                        pd_response_code: null
+                    }));
+                    
+                    await db.dispatcher_runs.bulkCreate(dispatcherRuns, { 
+                        ignoreDuplicates: true 
+                    });
+                    
+                } else if (run.update_type === 'stale') {
+                    // Update non-final statuses in case Kafka messages were missed
+                    for (const d of dispatcherData.data) {
+                        await db.dispatcher_runs.update(
+                            { 
+                                status: d.status,
+                                updated_at: new Date()
+                            },
+                            { 
+                                where: { 
+                                    dispatcher_run_id: d.id,
+                                    remediations_run_id: run.id 
+                                } 
+                            }
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            log.warn(`Failed to update dispatcher_runs for playbook run ${run.id}:`, error.message);
+            continue;
+        }
+    }
+}
 
 const REMEDIATION_ATTRIBUTES = [
     'id',
@@ -86,12 +198,17 @@ exports.list = async function (
 
     const {Op, s: {literal, where, col, cast}, fn: { DISTINCT, COUNT, MAX }} = db;
 
-    let sortOrder = [];
+    // Only call playbook-dispatcher API when we need status data for sorting/filtering
+    if (primaryOrder === 'status' || (filter && filter.status)) {
+        await ensureDispatcherRunsForStatusQueries(tenant_org_id, created_by);
+    }
+
+    const sortOrder = [];
 
     // set primary sort
     switch (primaryOrder) {
         case 'status':
-            sortOrder.push([literal('MAX(dispatcher_runs.status)'), asc ? 'ASC' : 'DESC']);
+            sortOrder.push([literal(aggregateStatusSQL()), asc ? 'ASC' : 'DESC']);
             break;
 
         case 'last_run_at':
@@ -120,7 +237,7 @@ exports.list = async function (
             [cast(COUNT(DISTINCT(col('issues->systems.system_id'))), 'int'), 'system_count'],
             [resolvedCountSubquery(), 'resolved_count'],
             [MAX(col('playbook_runs.created_at')), 'last_run_at'],
-            [MAX(col('dispatcher_runs.status')), 'status']
+            [literal(aggregateStatusSQL()), 'status']
         ],
         include: [{
             attributes: [],
@@ -136,12 +253,13 @@ exports.list = async function (
             model: db.playbook_runs,
             as: 'playbook_runs',
             attributes: [],
-            required: false
-        },
-        {
-            model: db.dispatcher_runs,
-            attributes: [],
-            required: false
+            required: false,
+            include: [{
+                model: db.dispatcher_runs,
+                as: 'dispatcher_runs',
+                attributes: [],
+                required: false
+            }]
         }],
         where: {
             tenant_org_id,
@@ -170,8 +288,6 @@ exports.list = async function (
             [Op.eq]: false
         };
     }
-
-    let remediationStatusCounts = null;
 
     if (filter) {
         // name filter
@@ -220,6 +336,13 @@ exports.list = async function (
         // updated_after filter
         if (filter.updated_after) {
             query.where["updated_at"] = { [Op.gt]: new Date(filter.updated_after) };
+        }
+
+        // status filter
+        if (filter.status) {
+            // Filter by calculated aggregate status
+            const statusCondition = aggregateStatusSQL();
+            query.having = literal(`(${statusCondition}) = '${filter.status}'`);
         }
     }
 
