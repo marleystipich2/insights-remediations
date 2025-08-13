@@ -23,7 +23,7 @@ describe('compliance impl', function () {
         } catch (error) {
             error.should.be.instanceOf(errors.BadRequest);
             error.error.code.should.equal('INVALID_ISSUE_IDENTIFIER');
-            error.message.should.match(/Use Compliance API v2 format/);
+            error.message.should.match(/Compliance v1 issue identifiers have been retired/);
         }
     });
 

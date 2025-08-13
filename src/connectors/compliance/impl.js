@@ -21,7 +21,10 @@ module.exports = new class extends Connector {
         // Compliance API v1 is deprecated. Require v2 format with ssgVersion
         // Note: ssgVersion is extracted by identifiers.parseSSG() and will be null for v1 format
         if (!ssgVersion) {
-            throw errors.invalidIssueId(`${id} - Use Compliance API v2 format: ssg:xccdf_org.ssgproject.content_benchmark_RHEL-X|version|profile|xccdf_org.ssgproject.content_rule_${id}`);
+            throw new errors.BadRequest(
+                'INVALID_ISSUE_IDENTIFIER',
+                `Compliance v1 issue identifiers have been retired. Please update your v1 issue ID, "${id}", to the v2 format of "ssg:xccdf_org.ssgproject.content_benchmark_RHEL-X|version|profile|xccdf_org.ssgproject.content_rule_${id}"`
+            );
         }
 
         for (let i = 0; i <= retries; i++) {
